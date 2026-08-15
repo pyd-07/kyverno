@@ -8,6 +8,7 @@ import (
 	"github.com/kyverno/sdk/extensions/cel/libs/generator"
 	"github.com/kyverno/sdk/extensions/cel/libs/versions"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
@@ -751,4 +752,25 @@ generator.apply(
 			assert.Equal(t, tt.wantProgs, len(gotProgs))
 		})
 	}
+}
+
+func TestCompileValidationRetainsAST(t *testing.T) {
+	env, err := cel.NewEnv(
+		cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)),
+	)
+	require.NoError(t, err)
+
+	rule := admissionregistrationv1.Validation{
+		Expression: `request.user == "admin"`,
+	}
+
+	validation, errs := CompileValidation(
+		field.NewPath("spec", "validations").Index(0),
+		env,
+		rule,
+	)
+
+	require.Empty(t, errs)
+	require.NotNil(t, validation.AST)
+	require.NotNil(t, validation.Program)
 }
