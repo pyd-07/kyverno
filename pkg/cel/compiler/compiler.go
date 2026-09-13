@@ -146,11 +146,12 @@ func CompileValidation(path *field.Path, env *cel.Env, rule admissionregistratio
 			msg := fmt.Sprintf("output is expected to be of type %s", types.BoolType.TypeName())
 			return Validation{}, append(allErrs, field.Invalid(path, rule.Expression, msg))
 		}
-		program, err := env.Program(ast)
+		program, err := env.Program(ast, cel.EvalOptions(cel.OptTrackState))
 		if err != nil {
 			return Validation{}, append(allErrs, field.Invalid(path, rule.Expression, err.Error()))
 		}
 		compiled.Program = program
+		compiled.AST = ast
 	}
 	if rule.MessageExpression != "" {
 		path := path.Child("messageExpression")

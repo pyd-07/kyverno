@@ -18,6 +18,7 @@ type EvaluationResult struct {
 	Message          string
 	Index            int
 	Result           bool
+	Trace            []TraceEntry
 	AuditAnnotations map[string]string
 	Exceptions       []*policiesv1beta1.PolicyException
 	PatchedResource  unstructured.Unstructured

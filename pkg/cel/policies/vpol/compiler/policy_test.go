@@ -10,6 +10,8 @@ import (
 	policiesv1beta1 "github.com/kyverno/api/api/policies.kyverno.io/v1beta1"
 	"github.com/kyverno/kyverno/pkg/cel/compiler"
 	"github.com/stretchr/testify/assert"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	"k8s.io/apiserver/pkg/cel/lazy"
 )
 
 // mockVpolProgram is a lightweight cel.Program stub for unit tests.
@@ -171,4 +173,208 @@ func TestEvaluateWithData_FullExemptionPrecedence(t *testing.T) {
 		// Both exceptions must be present so the engine sees the complete set.
 		assert.Len(t, result.Exceptions, 2, "both exceptions must be collected by the exhaustive loop")
 	})
+}
+
+func TestCompileValidationAndCollectTrace(t *testing.T) {
+	policy := &policiesv1beta1.ValidatingPolicy{
+		Spec: policiesv1beta1.ValidatingPolicySpec{
+			MatchConstraints: &admissionregistrationv1.MatchResources{},
+			Validations: []admissionregistrationv1.Validation{
+				{
+					Expression: `object.metadata.name == "nginx"`,
+				},
+			},
+		},
+	}
+
+	compiled, errs := NewCompiler().Compile(policy, nil)
+	assert.Empty(t, errs)
+	assert.NotNil(t, compiled)
+	assert.Len(t, compiled.validations, 1)
+
+	validation := compiled.validations[0]
+
+	// Our AST-retention change.
+	assert.NotNil(t, validation.AST)
+
+	// Execute the real compiled CEL program.
+	data := evaluationData{
+		Object: map[string]any{
+			"metadata": map[string]any{
+				"name": "nginx",
+			},
+		},
+		Variables: lazy.NewMapValue(compiler.VariablesType),
+	}
+
+	dataNew := map[string]any{
+		compiler.ObjectKey:    data.Object,
+		compiler.VariablesKey: data.Variables,
+	}
+
+	out, details, err := validation.Program.ContextEval(context.Background(), dataNew)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, details)
+	assert.Equal(t, types.Bool(true), out)
+
+	trace, err := collectTrace(validation.AST, details.State())
+	assert.NoError(t, err)
+	assert.NotEmpty(t, trace)
+
+	t.Logf("trace: %+v", trace)
+
+	// The root expression must have been recorded.
+	found := false
+	for _, entry := range trace {
+		if entry.Expression == `object.metadata.name == "nginx"` {
+			found = true
+			break
+		}
+	}
+
+	assert.True(t, found, "expected validation expression in trace")
+}
+
+func TestCompileValidationAndCollectTrace_ComplexExpression(t *testing.T) {
+	expression := `
+		request.operation == "CREATE" &&
+		(
+			object.metadata.name.startsWith("prod-") ||
+			object.metadata.labels.exists(k, k == "environment")
+		) &&
+		(
+			object.spec.replicas > 0 &&
+			object.spec.replicas <= 10
+		) &&
+		(
+			object.spec.containers.all(
+				c,
+				c.image != "" &&
+				(
+					c.image.startsWith("registry.example.com/") ||
+					c.image.startsWith("ghcr.io/")
+				)
+			)
+		) &&
+		(
+			object.metadata.labels["team"] == "platform"
+				? object.spec.replicas >= 2
+				: object.spec.replicas == 1
+		)
+	`
+
+	policy := &policiesv1beta1.ValidatingPolicy{
+		Spec: policiesv1beta1.ValidatingPolicySpec{
+			MatchConstraints: &admissionregistrationv1.MatchResources{},
+			Validations: []admissionregistrationv1.Validation{
+				{
+					Expression: expression,
+				},
+			},
+		},
+	}
+
+	compiled, errs := NewCompiler().Compile(policy, nil)
+	assert.Empty(t, errs)
+	assert.NotNil(t, compiled)
+	assert.Len(t, compiled.validations, 1)
+
+	validation := compiled.validations[0]
+
+	assert.NotNil(t, validation.AST)
+	assert.NotNil(t, validation.Program)
+
+	data := evaluationData{
+		Object: map[string]any{
+			"metadata": map[string]any{
+				"name": "prod-api",
+				"labels": map[string]any{
+					"environment": "prod",
+					"team":        "platform",
+				},
+			},
+			"spec": map[string]any{
+				"replicas": int64(3),
+				"containers": []any{
+					map[string]any{
+						"image": "registry.example.com/api:v1",
+					},
+					map[string]any{
+						"image": "ghcr.io/sidecar:v2",
+					},
+				},
+			},
+		},
+		Request: map[string]any{
+			"operation": "CREATE",
+		},
+		Variables: lazy.NewMapValue(compiler.VariablesType),
+	}
+
+	dataNew := map[string]any{
+		compiler.ObjectKey:    data.Object,
+		compiler.RequestKey:   data.Request,
+		compiler.VariablesKey: data.Variables,
+	}
+
+	out, details, err := validation.Program.ContextEval(
+		context.Background(),
+		dataNew,
+	)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, details)
+	assert.Equal(t, types.Bool(true), out)
+
+	trace, err := collectTrace(validation.AST, details.State())
+	assert.NoError(t, err)
+	assert.NotEmpty(t, trace)
+
+	t.Logf("=== COMPLEX TRACE ===")
+
+	seenIDs := make(map[int64]bool)
+
+	for _, entry := range trace {
+		t.Logf(
+			"ID=%d Expression=%s Value=%v",
+			entry.ExpressionID,
+			entry.Expression,
+			entry.Value,
+		)
+
+		assert.False(
+			t,
+			seenIDs[entry.ExpressionID],
+			"duplicate expression ID %d",
+			entry.ExpressionID,
+		)
+
+		seenIDs[entry.ExpressionID] = true
+	}
+
+	expectedExpressions := []string{
+		`request.operation == "CREATE"`,
+		`object.metadata.name.startsWith("prod-")`,
+		`object.spec.replicas > 0`,
+		`object.spec.replicas <= 10`,
+		`c.image != ""`,
+		`c.image.startsWith("registry.example.com/")`,
+		`c.image.startsWith("ghcr.io/")`,
+		`object.metadata.labels["team"] == "platform"`,
+		`object.spec.replicas >= 2`,
+	}
+
+	for _, expected := range expectedExpressions {
+		found := false
+
+		for _, entry := range trace {
+			if entry.Expression == expected {
+				found = true
+				break
+			}
+		}
+
+		assert.True(t, found, "expected expression %q in trace", expected)
+	}
 }

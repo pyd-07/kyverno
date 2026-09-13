@@ -82,6 +82,7 @@ func (p *Policy) evaluateWithData(
 ) (*EvaluationResult, error) {
 	allowedImages := make([]string, 0)
 	allowedValues := make([]string, 0)
+	var trace []TraceEntry
 	dataNew := map[string]any{
 		compiler.NamespaceObjectKey: data.Namespace,
 		compiler.ObjectKey:          data.Object,
@@ -142,9 +143,19 @@ func (p *Policy) evaluateWithData(
 		})
 	}
 	for index, validation := range p.validations {
-		out, _, err := validation.Program.ContextEval(ctx, dataNew)
+		out, details, err := validation.Program.ContextEval(ctx, dataNew)
 		if err != nil {
 			return &EvaluationResult{Error: err, Index: index}, nil
+		}
+
+		if details != nil && validation.AST != nil {
+			trace, err = collectTrace(validation.AST, details.State())
+			if err != nil {
+				return &EvaluationResult{
+					Error: err,
+					Index: index,
+				}, nil
+			}
 		}
 		if outcome, err := utils.ConvertToNative[bool](out); err == nil && !outcome {
 			message := validation.Message
@@ -169,6 +180,7 @@ func (p *Policy) evaluateWithData(
 				Result:           outcome,
 				Message:          message,
 				Index:            index,
+				Trace:            trace,
 				AuditAnnotations: auditAnnotations,
 			}, nil
 		} else if err != nil {
